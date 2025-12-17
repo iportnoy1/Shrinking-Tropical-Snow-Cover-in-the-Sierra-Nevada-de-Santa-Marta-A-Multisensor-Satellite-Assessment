@@ -30,7 +30,7 @@ All satellite processing was conducted in **Google Earth Engine (GEE)**.
 
 ## Repository Contents
 
-SNSM_SnowCover_GEE.js        # Google Earth Engine source code
+GGE Source Code.txt        # Google Earth Engine source code
 
 SNSM_SnowCover_Analysis.R    # R script for area computation & plotting
 
@@ -42,4 +42,3 @@ SNSM_SCF_2024.tif
 
 README.md             
 LICENSE_CODE.txt
-LICENSE_DATA.txt

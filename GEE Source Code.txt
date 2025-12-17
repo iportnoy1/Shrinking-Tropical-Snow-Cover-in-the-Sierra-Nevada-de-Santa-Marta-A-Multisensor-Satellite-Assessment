@@ -1,0 +1,183 @@
+// SNSM snow cover
+var REGION = ee.Geometry.Rectangle([-73.8, 10.74, -73.55, 10.95]); // simple box over SNSM
+var dem = ee.Image('USGS/SRTMGL1_003'); // Loading Digital Elevation Model (DEM)
+var elevMin = 4800; //overall snow study
+var elevMask = dem.gte(elevMin).selfMask(); // image mask
+
+Map.centerObject(REGION, 9);
+Map.addLayer(elevMask, {min:0, max:1, palette:['000000','ffff00']}, 'Elevation ≥ 4800 m');
+
+// ---- 1) Year to process ----
+var TARGET_YEAR = 2025;
+var START = ee.Date.fromYMD(TARGET_YEAR, 1, 1);
+var END   = START.advance(1, 'year');
+
+// ---- 2) Functions ----
+function addNDSI_S2(img){ 
+  return img.addBands(img.normalizedDifference(['B3','B11']).rename('NDSI')); 
+}
+function addNDSI_L8(img){ 
+  return img.addBands(img.normalizedDifference(['SR_B3','SR_B6']).rename('NDSI')); 
+}
+function fsca(ndsi){ 
+  return ndsi.multiply(1.45).subtract(0.01).clamp(0,1).rename('fSCA'); 
+}
+function snowFrom(img, ndsiBand, greenBand){ 
+  return img.select(ndsiBand).gte(0.40).and(img.select(greenBand).gte(0.10)); 
+}
+
+// ---- 3) Sentinel-2 (L2A) ----
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterDate(START, END)
+  .filterBounds(REGION)
+  .map(function(img){
+    // mask clouds via SCL (keep snow=11)
+    var scl = img.select('SCL');
+    var cloudMask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10));
+    img = img.updateMask(cloudMask);
+    img = addNDSI_S2(img);
+    var snow = snowFrom(img, 'NDSI','B3').rename('SNOW');
+    var fs   = fsca(img.select('NDSI'));
+    // apply elevation mask here (cheap) + restrict to simple rectangle region
+    return img.addBands([snow, fs]).updateMask(elevMask).clip(REGION);
+  })
+  .select(['SNOW','fSCA','NDSI']);
+
+// ---- 4) Landsat 8/9 (C2 L2) ----
+function maskL8(img){
+  var qa = img.select('QA_PIXEL');
+  var cloud = qa.bitwiseAnd(1<<3).neq(0) // shadow
+           .or(qa.bitwiseAnd(1<<5).neq(0)); // cloud
+  return img.updateMask(cloud.not());
+}
+
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+  .filterDate(START, END)
+  .filterBounds(REGION)
+  .map(maskL8)
+  .map(function(img){
+    var sr = img.select('SR_B.*').multiply(0.0000275).add(-0.2);
+    var bt = img.select('ST_B10').multiply(0.00341802).add(149.0).rename('BT'); // K
+    img = img.addBands(sr, null, true).addBands(bt);
+    img = addNDSI_L8(img);
+    var snow = snowFrom(img,'NDSI','SR_B3')
+                 .and(img.select('BT').lt(283))
+                 .rename('SNOW');
+    var fs   = fsca(img.select('NDSI'));
+    return img.addBands([snow, fs]).updateMask(elevMask).clip(REGION);
+  })
+  .select(['SNOW','fSCA','NDSI']);
+
+// ---- 5) Merge sensors ----
+var all = s2.merge(l8);
+
+// ---- 6) Monthly metrics for the target year ----
+function monthlyMetrics(month){
+  var startM = ee.Date.fromYMD(TARGET_YEAR, month, 1);
+  var endM   = startM.advance(1, 'month');
+  var ic = all.filterDate(startM, endM);
+
+  var empty = ee.Image.constant([0,0,0,0])
+    .rename(['CLEAR','SNOW_CT','fSCA_MEAN','SCF'])
+    .toFloat()
+    .set({year: TARGET_YEAR, month: month, 'system:time_start': startM.millis()})
+    .clip(REGION);
+
+  var calc = (function(){
+    var clear = ic.select('SNOW').count().rename('CLEAR');
+    var snowCt = ic.select('SNOW').sum().rename('SNOW_CT');
+    var fMean  = ic.select('fSCA').mean().rename('fSCA_MEAN');
+    var scf    = snowCt.divide(clear.max(1)).rename('SCF');
+    return clear.addBands([snowCt, fMean, scf])
+                .toFloat()
+                .set({year: TARGET_YEAR, month: month, 'system:time_start': startM.millis()})
+                .clip(REGION);
+  })();
+
+  return ee.Image(ee.Algorithms.If(ic.size().gt(0), calc, empty));
+}
+
+var months = ee.ImageCollection(ee.List.sequence(1,12).map(monthlyMetrics));
+
+// ---- 7) Annual aggregate (SCF_MEAN and fSCA_MAX) ----
+var yImg = ee.Image.cat(
+  months.select('SCF').mean().rename('SCF_MEAN'),
+  months.select('fSCA_MEAN').max().rename('fSCA_MAX')
+).set('year', TARGET_YEAR).clip(REGION);
+
+// Quick view
+Map.addLayer(yImg.select('SCF_MEAN'), {min:0, max:1}, 'SCF_MEAN '+TARGET_YEAR);
+
+// =======================
+// 7b) Expected snow area + variance
+// =======================
+
+var nMonths = 12; 
+
+// Pixel-wise mean SCF for the year
+var scfMean = yImg.select('SCF_MEAN');  // mean of 12 monthly SCF values
+
+// Pixel-wise sum of squared deviations across the 12 months
+var scfSSD = months.select('SCF')
+  .map(function(img){
+    var d = img.subtract(scfMean);
+    return d.multiply(d);
+  })
+  .reduce(ee.Reducer.sum())
+  .rename('SCF_SSD');
+
+// Sample variance of SCF across months: s_i^2 = SSD / (n - 1)
+var scfVar = scfSSD.divide(nMonths - 1).rename('SCF_VAR');
+
+// Variance of the pixel-wise mean: Var(mean_i) = s_i^2 / n
+var scfVarMean = scfVar.divide(nMonths).rename('SCF_VAR_MEAN');
+
+// Pixel area in m² (masked to high elevation and region)
+var areaImg = ee.Image.pixelArea()
+  .updateMask(elevMask)
+  .clip(REGION)
+  .rename('AREA');
+
+// Expected snow area contribution per pixel: A_i * mean_i
+var snowArea = areaImg.multiply(scfMean).rename('SNOW_AREA');
+
+// Variance contribution per pixel to total area: A_i^2 * Var(mean_i)
+var varSnowArea = areaImg.multiply(areaImg)
+                         .multiply(scfVarMean)
+                         .rename('VAR_SNOW_AREA');
+
+// Stack area and variance bands
+var yearStatsImg = snowArea.addBands(varSnowArea);
+
+// Regional sums of expected area and variance
+var stats = yearStatsImg.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: REGION,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+print('Year-level stats dict:', stats);
+
+// Keys are band names: "SNOW_AREA", "VAR_SNOW_AREA"
+var A_year   = ee.Number(stats.get('SNOW_AREA'));       // Expected snow area (m²)
+var VarAyear = ee.Number(stats.get('VAR_SNOW_AREA'));   // Variance (m^4)
+var SE_year  = VarAyear.sqrt();                         // SE of area (m²)
+
+print('Year', TARGET_YEAR);
+print('Expected snow area (m²), equal-weight months:', A_year);
+print('Variance (m^4):', VarAyear);
+print('SE (m²):', SE_year);
+
+// ---- 8) Export to Drive (GeoTIFF of SCF_MEAN) ----
+Export.image.toDrive({
+  image: yImg.select('SCF_MEAN').unmask(0).toFloat(),
+  description: 'SNSM_SCF_' + TARGET_YEAR,
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'SNSM_SCF_' + TARGET_YEAR,
+  region: REGION,         
+  scale: 30,            
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
